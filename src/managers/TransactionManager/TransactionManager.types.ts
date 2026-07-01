@@ -1,22 +1,11 @@
-import { CreateTransactionsSessionType } from 'store/actions/transactions/transactionsActions';
-import { SessionCallbacksType } from './helpers/sessionCallbacks';
+import { TransactionRetryConfigType } from 'managers/internal/TransactionRetryManager';
 
-export type TransactionManagerTrackOptionsType = {
-  disableToasts?: boolean;
+export type TransactionManagerInitConfigType = {
   /**
-   * Optional custom information to be displayed in the toast notification.
+   * Retry configuration for transient polling failures.
+   * When omitted, the defaults from transactionRetry.constants.ts are used:
+   *   - maxRetries: 3
+   *   - retryDelay: 1000 ms (doubles per attempt — exponential backoff)
    */
-  transactionsDisplayInfo?: CreateTransactionsSessionType['transactionsDisplayInfo'];
-  /**
-   * Optional custom information to be associated with the transaction session.
-   */
-  sessionInformation?: CreateTransactionsSessionType['sessionInformation'];
-  /**
-   * Callback to be executed when the specific session id is successful
-   */
-  onSuccess?: SessionCallbacksType['onSuccess'];
-  /**
-   * Callback to be executed when the specific session id is failed
-   */
-  onFail?: SessionCallbacksType['onFail'];
+  retryConfig?: TransactionRetryConfigType;
 };
