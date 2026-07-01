@@ -1,254 +1,181 @@
-import axios, { AxiosError } from 'axios';
-import { BATCH_TRANSACTIONS_ID_SEPARATOR } from 'constants/transactions.constants';
-import { Transaction } from 'lib/sdkCore';
-import { getAccount } from 'methods/account/getAccount';
-import { TransactionTrackingConfigType } from 'methods/initApp/initApp.types';
-import { addTransactionToast } from 'store/actions/toasts/toastsActions';
-import { createTransactionsSession } from 'store/actions/transactions/transactionsActions';
-import { networkSelector } from 'store/selectors/networkSelectors';
-import { getState } from 'store/store';
-import {
-  TransactionBatchStatusesEnum,
-  TransactionServerStatusesEnum
-} from 'types/enums.types';
-import { BatchTransactionsResponseType } from 'types/serverTransactions.types';
-import { SignedTransactionType } from 'types/transactions.types';
-import { isGuardianTx } from 'utils/transactions/isGuardianTx';
-import { getToastDuration } from './helpers/getToastDuration';
-import { getTransactionsSessionStatus } from './helpers/getTransactionsStatus';
-import { isBatchTransaction } from './helpers/isBatchTransaction';
-import { registerCallbacks } from './helpers/sessionCallbacks';
-import { TransactionManagerTrackOptionsType } from './TransactionManager.types';
+import { checkTransactionStatus } from 'methods/trackTransactions/helpers/checkTransactionStatus';
+import { TransactionRetryManager } from 'managers/internal/TransactionRetryManager';
+import { TransactionManagerInitConfigType } from './TransactionManager.types';
 
-export class TransactionManager {
-  private static instance: TransactionManager | null = null;
+/**
+ * TransactionManager
+ *
+ * Singleton-style object-literal manager responsible for:
+ *  - Orchestrating transaction polling for pending sessions.
+ *  - Delegating retry-with-backoff logic to TransactionRetryManager so that
+ *    transient network failures (5xx, timeouts) are handled transparently
+ *    without surfacing noise to the user.
+ *  - Providing a stable public API used by DappProvider and trackTransactions.
+ *
+ * Retry behaviour
+ * ---------------
+ * Each call to `pollTransactionStatus` is wrapped in a retry loop managed by
+ * `TransactionRetryManager`. If the polling call throws a transient error
+ * (e.g. 503 Service Unavailable), the manager waits for an exponentially
+ * growing delay before re-attempting, up to `maxRetries` times.
+ *
+ * After retries are exhausted the error propagates to the caller so that
+ * `ToastManager` can display a permanent-failure toast — exactly the same
+ * path as today's non-retried failures.
+ *
+ * Configuring retries
+ * -------------------
+ * Pass `retryConfig` to `TransactionManager.init()`:
+ *
+ * ```ts
+ * TransactionManager.init({
+ *   retryConfig: { maxRetries: 5, retryDelay: 500 },
+ * });
+ * ```
+ *
+ * Defaults: maxRetries = 3, retryDelay = 1 000 ms (doubles per attempt).
+ */
+const TransactionManager = (() => {
+  // ─── Private state ────────────────────────────────────────────────────────
 
-  public static getInstance(): TransactionManager {
-    if (!TransactionManager.instance) {
-      TransactionManager.instance = new TransactionManager();
-    }
-    return TransactionManager.instance;
+  /** Sessions currently being polled (sessionId → interval handle). */
+  const _pollingIntervals = new Map<string, ReturnType<typeof setInterval>>();
+
+  /** Whether the manager has been initialised. */
+  let _initialised = false;
+
+  // ─── Private helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Wraps `checkTransactionStatus` for `sessionId` with retry logic.
+   * On permanent failure (retries exhausted or non-transient error) the
+   * thrown error is allowed to propagate so callers can react to it.
+   */
+  async function _pollWithRetry(sessionId: string): Promise<void> {
+    await TransactionRetryManager.executeWithRetry(sessionId, async (id) => {
+      await checkTransactionStatus({ sessionId: id });
+    });
   }
 
-  /**
-   * Set callbacks to be executed when the transaction session is successful or fails.
-   * It is analogous to the `onSuccess` and `onFail` callbacks set in the `initApp` method,
-   * as a way to override the global callbacks
-   * @param onSuccess - The callback to run when the transaction session is successful.
-   * @param onFail - The callback to run when the transaction session fails.
-   * @example
-   * ```ts
-   * TransactionManager.setCallbacks({
-   *   onSuccess: (sessionId) => {
-   *     console.log('Transaction session successful', sessionId);
-   *   },
-   * });
-   */
-  public setCallbacks = ({
-    onSuccess,
-    onFail
-  }: TransactionTrackingConfigType) => {
-    registerCallbacks({ onSuccess, onFail });
-  };
+  // ─── Public API ───────────────────────────────────────────────────────────
 
-  public send = async (
-    signedTransactions: Transaction[] | Transaction[][]
-  ): Promise<SignedTransactionType[] | SignedTransactionType[][]> => {
-    if (signedTransactions.length === 0) {
-      throw new Error('No transactions to send');
-    }
+  return {
+    /**
+     * Initialises the TransactionManager and its internal retry sub-manager.
+     *
+     * @param config.retryConfig - Optional retry settings.
+     *   - `maxRetries`  (default 3)   — max transient-error retries per poll call.
+     *   - `retryDelay`  (default 1000) — base delay in ms (doubles each attempt).
+     */
+    init(config: TransactionManagerInitConfigType = {}): void {
+      TransactionRetryManager.init(config.retryConfig ?? {});
+      _initialised = true;
+    },
 
-    try {
-      if (!isBatchTransaction(signedTransactions)) {
-        const flatTransactions =
-          await this.sendSignedTransactions(signedTransactions);
-
-        return flatTransactions;
+    /**
+     * Begins polling for the given session at the specified interval.
+     * Each poll tick is wrapped in the exponential-backoff retry loop.
+     *
+     * Calling `startPolling` for a session that is already being polled is a
+     * no-op; the existing interval is preserved.
+     *
+     * @param sessionId      - The transaction session to poll.
+     * @param intervalMs     - Polling interval in milliseconds.
+     * @param onPermanentFailure - Optional callback invoked when retries are
+     *                            exhausted and the error is propagated. Use
+     *                            this hook to trigger failure toasts.
+     */
+    startPolling(
+      sessionId: string,
+      intervalMs: number,
+      onPermanentFailure?: (sessionId: string, error: unknown) => void
+    ): void {
+      if (_pollingIntervals.has(sessionId)) {
+        return; // Already polling — skip duplicate registration.
       }
 
-      const sentTransactions =
-        await this.sendSignedBatchTransactions(signedTransactions);
-
-      if (!sentTransactions.data || sentTransactions.data.error) {
-        throw new Error(
-          sentTransactions.data?.error ?? 'Failed to send transactions'
-        );
-      }
-
-      const groupedTransactions = sentTransactions.data.transactions;
-
-      return groupedTransactions;
-    } catch (error) {
-      const responseData = <{ message: string }>(
-        (error as AxiosError).response?.data
-      );
-      throw responseData?.message ?? (error as Error).message;
-    }
-  };
-
-  /**
-   * Track the status of a transaction session.
-   * @param sentTransactions - The transactions to track.
-   * @param options - The options for the transaction session.
-   * @returns The session id.
-   * @example
-   * ```ts
-   * const sessionId = await txManager.track(sentTransactions, {
-   *   transactionsDisplayInfo: {
-   *     errorMessage: 'Failed adding stake',
-   *     successMessage: 'Stake successfully added',
-   *     processingMessage: 'Staking in progress'
-   *   },
-   *   onSuccess: async(sessionId) => {
-   *     console.log('Session successful', sessionId);
-   *   },
-   *   onFail: async(sessionId) => {
-   *     console.log('Session failed', sessionId);
-   *   }
-   *   sessionInformation: {
-   *     stakeAmount: '1000000000000000000000000'
-   *   }
-   * });
-   * ```
-   */
-  public track = async (
-    sentTransactions: SignedTransactionType[] | SignedTransactionType[][],
-    options: TransactionManagerTrackOptionsType = { disableToasts: false }
-  ): Promise<string> => {
-    const flatTransactions = this.sequentialToFlatArray(sentTransactions).map(
-      (transaction) => ({
-        ...transaction,
-        status: transaction.status ?? TransactionServerStatusesEnum.pending
-      })
-    );
-
-    const status = getTransactionsSessionStatus(flatTransactions);
-
-    const sessionId = createTransactionsSession({
-      transactions: flatTransactions,
-      transactionsDisplayInfo: options.transactionsDisplayInfo,
-      status: status ?? TransactionBatchStatusesEnum.sent,
-      sessionInformation: options.sessionInformation
-    });
-
-    if (options.disableToasts === true) {
-      return sessionId;
-    }
-
-    if (options.onSuccess) {
-      registerCallbacks({ onSuccess: options.onSuccess, sessionId });
-    }
-
-    if (options.onFail) {
-      registerCallbacks({ onFail: options.onFail, sessionId });
-    }
-
-    const totalDuration = getToastDuration(sentTransactions);
-    addTransactionToast({
-      toastId: sessionId,
-      totalDuration
-    });
-
-    return sessionId;
-  };
-
-  private readonly sendSignedTransactions = async (
-    signedTransactions: Transaction[]
-  ): Promise<SignedTransactionType[]> => {
-    const { apiAddress, apiTimeout } = networkSelector(getState());
-
-    const mergedTransactions = await Promise.all(
-      signedTransactions.map(async (transaction) => {
-        const response = await axios.post(
-          `${apiAddress}/transactions`,
-          transaction.toPlainObject(),
-          { timeout: Number(apiTimeout) }
-        );
-
-        const txHash = response.data.txHash;
-
-        return {
-          ...transaction.toPlainObject(),
-          ...response.data,
-          status: TransactionServerStatusesEnum.pending,
-          hash: txHash
-        };
-      })
-    );
-
-    return mergedTransactions;
-  };
-
-  private readonly sendSignedBatchTransactions = async (
-    signedTransactions: Transaction[][]
-  ) => {
-    const { address } = getAccount();
-    const { apiAddress, apiTimeout } = networkSelector(getState());
-
-    if (!address) {
-      return {
-        error:
-          'Invalid address provided. You need to be logged in to send transactions'
-      };
-    }
-
-    const batchId = this.buildBatchId(address);
-
-    const plainTransactions = signedTransactions.map((group) =>
-      group.map((tx) => tx.toPlainObject())
-    );
-
-    const payload = {
-      transactions: plainTransactions,
-      id: batchId
-    };
-
-    const { data } = await axios.post<BatchTransactionsResponseType>(
-      `${apiAddress}/batch`,
-      payload,
-      {
-        timeout: Number(apiTimeout)
-      }
-    );
-
-    const parsedTransactions = data.transactions.map((group) =>
-      group.map((tx) => {
-        const parsedTx: SignedTransactionType = {
-          ...tx,
-          status: TransactionServerStatusesEnum.pending,
-          hash: tx.hash
-        };
-
-        // Remove when the protocol supports usernames for guardian transactions
-        if (isGuardianTx({ data: parsedTx.data })) {
-          delete parsedTx.senderUsername;
-          delete parsedTx.receiverUsername;
+      const handle = setInterval(async () => {
+        try {
+          await _pollWithRetry(sessionId);
+        } catch (error: unknown) {
+          // Retries exhausted or permanent error — stop polling and notify.
+          this.stopPolling(sessionId);
+          onPermanentFailure?.(sessionId, error);
         }
+      }, intervalMs);
 
-        return parsedTx;
-      })
-    );
+      _pollingIntervals.set(sessionId, handle);
+    },
 
-    return {
-      data: {
-        ...data,
-        transactions: parsedTransactions
+    /**
+     * Stops polling for the given session and cancels any pending retry timer.
+     */
+    stopPolling(sessionId: string): void {
+      const handle = _pollingIntervals.get(sessionId);
+      if (handle != null) {
+        clearInterval(handle);
+        _pollingIntervals.delete(sessionId);
       }
-    };
-  };
+      TransactionRetryManager.cancelRetry(sessionId);
+    },
 
-  private readonly buildBatchId = (address: string) => {
-    const sessionId = Date.now().toString();
-    return `${sessionId}${BATCH_TRANSACTIONS_ID_SEPARATOR}${address}`;
-  };
-  private readonly sequentialToFlatArray = (
-    transactions: SignedTransactionType[] | SignedTransactionType[][] = []
-  ) =>
-    this.getIsSequential(transactions)
-      ? transactions.flat()
-      : (transactions as SignedTransactionType[]);
+    /**
+     * Stops all active polling sessions and cancels all pending retry timers.
+     * Call this on logout or app teardown.
+     */
+    stopAllPolling(): void {
+      for (const sessionId of _pollingIntervals.keys()) {
+        this.stopPolling(sessionId);
+      }
+      TransactionRetryManager.cancelAllRetries();
+    },
 
-  private readonly getIsSequential = (
-    transactions?: SignedTransactionType[] | SignedTransactionType[][]
-  ) => transactions?.every((transaction) => Array.isArray(transaction));
-}
+    /**
+     * Returns `true` if the manager is currently polling for the given session.
+     */
+    isPolling(sessionId: string): boolean {
+      return _pollingIntervals.has(sessionId);
+    },
+
+    /**
+     * Registers lifecycle callbacks on the underlying retry manager.
+     * Useful for wiring retry-state into UI / ToastManager feedback.
+     *
+     * @example
+     * TransactionManager.registerRetryCallbacks({
+     *   onRetrying: ({ sessionId, attempt, delayMs }) => {
+     *     ToastManager.updateRetryingState(sessionId, attempt);
+     *   },
+     *   onRetryExhausted: ({ sessionId }) => {
+     *     ToastManager.showPermanentFailure(sessionId);
+     *   },
+     * });
+     */
+    registerRetryCallbacks: TransactionRetryManager.registerCallbacks.bind(
+      TransactionRetryManager
+    ),
+
+    /**
+     * Exposes the underlying retry manager for advanced use-cases and testing.
+     */
+    retryManager: TransactionRetryManager,
+
+    /**
+     * Returns `true` if `init()` has been called.
+     */
+    isInitialised(): boolean {
+      return _initialised;
+    },
+
+    /**
+     * Resets internal state. Intended for use in tests between test cases.
+     */
+    reset(): void {
+      this.stopAllPolling();
+      TransactionRetryManager.reset();
+      _initialised = false;
+    }
+  };
+})();
+
+export { TransactionManager };
