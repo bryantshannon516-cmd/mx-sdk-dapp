@@ -27,6 +27,11 @@ import { WalletConnectV2Error, WalletConnectConfig } from './types';
 import { BaseProviderStrategy } from '../BaseProviderStrategy/BaseProviderStrategy';
 import { signMessage } from '../helpers/signMessage/signMessage';
 import { guardTransactions } from '../helpers/signTransactions/helpers/guardTransactions/guardTransactions';
+import {
+  persistWalletConnectSession,
+  getPersistedWalletConnectSession,
+  clearPersistedWalletConnectSession
+} from './helpers/walletConnectSession';
 
 const dappMethods: string[] = [
   WalletConnectOptionalMethodsEnum.CANCEL_ACTION,
@@ -44,6 +49,12 @@ export class WalletConnectProviderStrategy extends BaseProviderStrategy {
   private _approval: (() => Promise<SessionTypes.Struct>) | null = null;
   protected cancelActionAbortController: AbortController | null = null;
 
+  /**
+   * Indicates that a silent reconnect attempt is in progress.  Exposed so
+   * the `useGetIsWalletConnectReconnecting` hook can surface it to the UI.
+   */
+  public isReconnecting = false;
+
   constructor(config: WalletConnectProviderStrategyConfigType) {
     super();
     this.config = config;
@@ -55,6 +66,18 @@ export class WalletConnectProviderStrategy extends BaseProviderStrategy {
         return true;
       }
 
+      // ── Silent-reconnect path ──────────────────────────────────────────────
+      const persisted = getPersistedWalletConnectSession();
+      if (persisted) {
+        const reconnected = await this.tryReconnectFromSession(persisted);
+        if (reconnected) {
+          return true;
+        }
+        // Session was stale – clear it and fall through to a fresh pairing.
+        clearPersistedWalletConnectSession();
+      }
+      // ── New-pairing path ───────────────────────────────────────────────────
+
       await this.initializeProvider();
     } catch {
       return false;
@@ -64,6 +87,8 @@ export class WalletConnectProviderStrategy extends BaseProviderStrategy {
   }
 
   logout(): Promise<boolean> {
+    clearPersistedWalletConnectSession();
+
     if (!this.provider) {
       throw new Error(ProviderErrorsEnum.notInitialized);
     }
@@ -93,6 +118,50 @@ export class WalletConnectProviderStrategy extends BaseProviderStrategy {
     }
 
     return this.provider.isInitialized();
+  }
+
+  // ── Private helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Attempts to silently reconnect using a previously persisted session.
+   *
+   * The flow is:
+   * 1. Build a fresh WalletConnectV2Provider instance (same as normal init).
+   * 2. Call `init()` on the underlying provider so it restores the existing
+   *    WalletConnect session from the relay / internal storage.
+   * 3. Check whether the provider ended up with the same topic as the
+   *    persisted session – if yes, the session is still live.
+   *
+   * @returns `true` when reconnection succeeds, `false` otherwise.
+   */
+  private async tryReconnectFromSession(
+    session: SessionTypes.Struct
+  ): Promise<boolean> {
+    this.isReconnecting = true;
+    try {
+      const { walletConnectProvider, dappMethods: dAppMethods } =
+        await this.createWalletConnectProvider(this.config);
+
+      this.provider = walletConnectProvider;
+      this.methods = dAppMethods;
+
+      // The WalletConnect SDK restores sessions from its own storage during
+      // `init()`.  Verify the expected topic is still alive.
+      const address = this.provider.getAddress();
+      const topicMatches =
+        (this.provider as unknown as { session?: { topic?: string } })
+          .session?.topic === session.topic;
+
+      if (address && topicMatches) {
+        return true;
+      }
+
+      return false;
+    } catch {
+      return false;
+    } finally {
+      this.isReconnecting = false;
+    }
   }
 
   private async initializeProvider() {
@@ -151,6 +220,7 @@ export class WalletConnectProviderStrategy extends BaseProviderStrategy {
     const handleOnLogin = () => {};
 
     const handleOnLogout = () => {
+      clearPersistedWalletConnectSession();
       logoutAction();
     };
 
@@ -232,6 +302,14 @@ export class WalletConnectProviderStrategy extends BaseProviderStrategy {
 
         const { address = '', signature = '' } = providerInfo ?? {};
 
+        // Persist the newly established session.
+        const rawSession = (
+          this.provider as unknown as { session?: SessionTypes.Struct }
+        ).session;
+        if (rawSession) {
+          persistWalletConnectSession(rawSession);
+        }
+
         walletConnectManager.handleClose({ isLoginFinished: Boolean(address) });
         return { address, signature };
       } catch {
@@ -250,6 +328,14 @@ export class WalletConnectProviderStrategy extends BaseProviderStrategy {
       });
 
       const { address = '', signature = '' } = providerData ?? {};
+
+      // Persist the newly established session.
+      const rawSession = (
+        this.provider as unknown as { session?: SessionTypes.Struct }
+      ).session;
+      if (rawSession) {
+        persistWalletConnectSession(rawSession);
+      }
 
       const walletConnectManager = WalletConnectStateManager.getInstance();
       walletConnectManager.handleClose({ isLoginFinished: Boolean(address) });
