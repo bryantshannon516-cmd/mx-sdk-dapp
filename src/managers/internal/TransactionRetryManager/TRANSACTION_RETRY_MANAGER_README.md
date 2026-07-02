@@ -1,119 +1,49 @@
 # TransactionRetryManager
 
-An internal singleton-style manager (object-literal pattern) that wraps any asynchronous transaction-polling action with **exponential-backoff retry** logic for transient network failures.
-
----
-
-## Why it exists
-
-Transaction polling calls (`checkTransactionStatus`) can fail intermittently due to:
-
-- Short-lived API outages (503 Service Unavailable)
-- Network congestion / gateway timeouts (502, 504)
-- Rate-limiting (429 Too Many Requests)
-- Client-side flakiness (ECONNRESET, ETIMEDOUT, socket hang up)
-
-Without retries, a single dropped packet causes a permanent-failure toast even though the user's transaction completed successfully on-chain. `TransactionRetryManager` absorbs these transient blips transparently.
-
----
+An object-literal singleton that manages per-session transaction retry state with **exponential backoff** for transient failures.
 
 ## Architecture
 
-```
-TransactionManager
-    └── executeWithRetry(sessionId, action)
-            └── TransactionRetryManager._attempt()
-                    ├── action(sessionId)          ← actual polling call
-                    ├── isTransientError()         ← decide to retry or re-throw
-                    ├── computeBackoffDelay()      ← 1s → 2s → 4s …
-                    └── setTimeout → recurse
-```
+`TransactionRetryManager` follows the same object-literal singleton pattern as `WalletConnectReconnectManager`.
 
-The manager is an **IIFE-returned object literal** (same pattern as `NotificationsFeedManager`) — there is no class and no `new` keyword. All state is private to the closure.
+It is responsible for:
 
----
+- Tracking retry counts per transaction session ID (in-memory only).
+- Scheduling delayed retry attempts using configurable exponential backoff.
+- Distinguishing **transient errors** (network timeouts, temporary API unavailability) from **terminal errors** (invalid transactions, insufficient funds) — only transient errors trigger retries.
+- Emitting named lifecycle events (`onRetrying`, `onRetrySucceeded`, `onRetryExhausted`) so the UI layer can reflect retry state without tight coupling.
+- Clearing retry state on success, exhaustion, or explicit cancellation.
 
-## Retry logic
-
-| Attempt | Delay before next call |
-|---------|------------------------|
-| 0       | (immediate — first try) |
-| 1       | `baseDelayMs × 2⁰`     |
-| 2       | `baseDelayMs × 2¹`     |
-| 3       | `baseDelayMs × 2²`     |
-| …       | …                      |
-
-Default values (from `src/constants/transactionRetry.constants.ts`):
-
-- `maxRetries`: **3**
-- `baseDelayMs`: **1 000 ms**
-
-Resulting delays with defaults: **1 s → 2 s → 4 s** (total extra wait ≤ 7 s).
-
----
-
-## Transient vs permanent errors
-
-| Condition | Retried? |
-|-----------|----------|
-| HTTP 408, 429, 500, 502, 503, 504 | ✅ Yes |
-| Message contains "network error", "timeout", "econnreset", … | ✅ Yes |
-| Unknown error (no code, no message) | ✅ Yes (fail-safe) |
-| HTTP 400, 401, 403, 404, 422, … | ❌ No — propagated immediately |
-
----
-
-## Configuration
+## Usage
 
 ```ts
-// In TransactionManager.init() or standalone:
-TransactionRetryManager.init({
-  maxRetries: 5,    // override default of 3
-  retryDelay: 500,  // base delay in ms; default 1000
+import { TransactionRetryManager } from 'managers/internal/TransactionRetryManager';
+
+// Schedule a retry for a session
+TransactionRetryManager.scheduleRetry('session-123', async () => {
+  await pollTransactionStatus('session-123');
 });
+
+// Listen for events
+TransactionRetryManager.onRetrying = (sessionId, attempt) => {
+  store.setRetrying(sessionId, attempt);
+};
+TransactionRetryManager.onRetryExhausted = (sessionId) => {
+  store.setRetryFailed(sessionId);
+};
 ```
 
----
+## Constants
 
-## Lifecycle callbacks
+Retry configuration defaults live in `src/constants/transactionRetry.constants.ts`:
 
-```ts
-TransactionRetryManager.registerCallbacks({
-  onRetrying: ({ sessionId, attempt, delayMs, error }) => {
-    // e.g. update a "Retrying…" toast
-  },
-  onRetryExhausted: ({ sessionId, totalAttempts, lastError }) => {
-    // e.g. show permanent-failure toast
-  },
-});
-```
+| Constant                        | Default | Description                          |
+| ------------------------------- | ------- | ------------------------------------ |
+| `TRANSACTION_RETRY_MAX_RETRIES` | `3`     | Maximum number of retry attempts     |
+| `TRANSACTION_RETRY_BASE_DELAY_MS` | `1000` | Base delay in ms (doubled each time) |
+| `TRANSACTION_RETRY_MAX_DELAY_MS`  | `8000` | Upper cap on backoff delay           |
 
----
+## Related
 
-## Session management
-
-Each `sessionId` has isolated retry state. You can:
-
-- `cancelRetry(sessionId)` — cancel a specific session's pending timer.
-- `cancelAllRetries()` — cancel all pending timers (use on logout).
-- `getSessionState(sessionId)` — inspect retry count (testing / debugging).
-
----
-
-## Files
-
-```
-TransactionRetryManager/
-├── TransactionRetryManager.ts          ← main manager (singleton object literal)
-├── index.ts                            ← barrel export
-├── TRANSACTION_RETRY_MANAGER_README.md ← this file
-├── helpers/
-│   ├── computeBackoffDelay.ts          ← baseDelayMs * 2^attemptIndex
-│   ├── extractRetryError.ts            ← normalises unknown thrown → RetryErrorType
-│   └── isTransientError.ts             ← decides retry vs propagate
-└── tests/
-    ├── TransactionRetryManager.test.ts ← full retry lifecycle tests
-    ├── computeBackoffDelay.test.ts
-    ├── extractRetryError.test.ts
-    └── isTransientError.test.ts
-```
+- `src/react/hooks/useGetTransactionRetryState` — exposes retry state to React components.
+- `src/managers/TransactionManager` — delegates retry scheduling to this manager.
